@@ -5,12 +5,44 @@
 #define signalPinYaw 46      // Pino de controle do ESC para yaw
 #define encoderPinAPitch 18  // Pino do sinal A do encoder de pitch
 #define encoderPinBPitch 19  // Pino do sinal B do encoder de pitch
-#define encoderPinAYaw 2     // Pino do sinal A do encoder de yaw
-#define encoderPinBYaw 3     // Pino do sinal B do encoder de yaw
+#define encoderPinAYaw 20    // Pino do sinal A do encoder de yaw
+#define encoderPinBYaw 21    // Pino do sinal B do encoder de yaw
+
+/*========================================================================================================
+****************************************** Secção de Calibração ******************************************
+===========================================================================================================*/
+// Limites de ângulo para pitch
+const float pitchLimitRadMax = radians(25);
+const float pitchLimitRadMin = radians(-15);
+
+const float controlPotMaxPitch = 70;
+const float controlPotMaxYaw = 40;
+
+const float maxVPitch = 30.0;
+const float minVPitch = -30.0;
+const float maxVYaw = 50.0;
+const float minVYaw = 0.0;
+
+const float integralMaxPitch = 1000.0;
+const float integralMaxYaw = 0.25;
+
+// Variáveis para o controle PID do pitch
+const float KpPitch = 65, KiPitch = 45.0, KdPitch = 5.5;
+float integralPitch = 0.0, previousErrorPitch = 0.0;
+
+// Variáveis para o controle PID do yaw
+const float KpYaw = 80.0, KiYaw = 90.0, KdYaw = 25.0;
+float integralYaw = 0.0, previousErrorYaw = 0.0;
+//========================================================================================================
+const float PotMaxPitch = (controlPotMaxPitch / 100.0) * 180.0;
+const float PotMaxYaw = (controlPotMaxYaw / 100.0) * 180.0;
 
 // Declaração dos objetos Servo para ESCs
 Servo escPitch;
 Servo escYaw;
+
+float setpointPitch = 0.0;
+float setpointYaw = 0.0;
 
 // Variáveis do encoder
 volatile long pulseCountClockwisePitch = 0;
@@ -25,27 +57,9 @@ volatile bool lastBPitch = LOW;
 volatile bool lastAYaw = LOW;
 volatile bool lastBYaw = LOW;
 
-// Limites de ângulo para pitch e yaw em radianos
-const float pitchLimitRad = radians(40);  // Limite de 40 graus
-const float yawLimitRad = radians(180);   // Limite de 180 graus
+// Variáveis de tempo para cálculo do intervalo de tempo dinâmico
+unsigned long lastTimePID = 0;
 
-// Variáveis de estado para cálculo de velocidade angular
-float previousPitchAngleRad = 0.0;
-float previousYawAngleRad = 0.0;
-unsigned long lastTimePitch = 0;
-unsigned long lastTimeYaw = 0;
-
-// Setpoints (em radianos, mas entrada será em graus)
-float setpointPitch = 0.0;
-float setpointYaw = 0.0;
-
-// Matrizes de ganho K mocadas
-float K[2][4] = {
-  {31.6148, 7.8464, 0.0, 0.0},     // Ganhos para pitch
-  {0.0, 0.0, 7.9776, 31.1976}      // Ganhos para yaw
-};
-
-// Função de configuração do sistema
 void setup() {
   // Inicializa ESCs
   escPitch.attach(signalPinPitch, 1000, 2000);
@@ -57,109 +71,112 @@ void setup() {
   pinMode(encoderPinAYaw, INPUT_PULLUP);
   pinMode(encoderPinBYaw, INPUT_PULLUP);
 
+  Serial.begin(250000);  // Inicia comunicação serial
+  Serial.println("Dê o comando de inicialização.");
+
+  while (true) {
+    if (Serial.available() > 0) {
+      String input = Serial.readStringUntil('\n');
+      if (input == "a") break;  // Processa o input serial para definir os setpoints
+    }
+    escPitch.write(0);
+    escYaw.write(0);
+  }
+
   // Configura interrupções para os pinos A e B de pitch e yaw
   attachInterrupt(digitalPinToInterrupt(encoderPinAPitch), handleEncoderPitch, CHANGE);
   attachInterrupt(digitalPinToInterrupt(encoderPinBPitch), handleEncoderPitch, CHANGE);
   attachInterrupt(digitalPinToInterrupt(encoderPinAYaw), handleEncoderYaw, CHANGE);
   attachInterrupt(digitalPinToInterrupt(encoderPinBYaw), handleEncoderYaw, CHANGE);
-
-  Serial.begin(9600);  // Inicia comunicação serial
 }
 
-// Função principal de controle
 void loop() {
+  // Calcula o intervalo de tempo desde o último ciclo
+  unsigned long currentTime = millis();
+  float dt = (currentTime - lastTimePID) / 1000.0;  // Convertendo para segundos
+
+  // Verificação para garantir que dt nunca seja zero ou extremamente pequeno
+  if (dt < 0.001) dt = 0.001;  // Define um limite mínimo para dt de 1ms
+
+  lastTimePID = currentTime;
+
   // Verifica se há dados disponíveis na serial (para setpoints)
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
-    processSetpoint(input);  // Processa o input serial para definir os setpoints
+    processSetpoint(input, setpointPitch, pitchLimitRadMin, pitchLimitRadMax);  // Processa o input serial para definir os setpoints
   }
 
   // Calcula os ângulos baseados nos encoders (em radianos)
-  float pitchAngleRad = constrain(calculateAngle(pulseCountCounterClockwisePitch, pulseCountClockwisePitch), -pitchLimitRad, pitchLimitRad);
-  float yawAngleRad = constrain(calculateAngle(pulseCountCounterClockwiseYaw, pulseCountClockwiseYaw), -yawLimitRad, yawLimitRad);
+  float pitchAngleRad = calculateAngle(pulseCountCounterClockwisePitch, pulseCountClockwisePitch);
+  float yawAngleRad = calculateAngle(pulseCountClockwiseYaw, pulseCountCounterClockwiseYaw);
 
-  // Calcula a velocidade angular com base na variação do tempo
-  float pitchAngularVelocity = calculateAngularVelocity(pitchAngleRad, previousPitchAngleRad, lastTimePitch);
-  float yawAngularVelocity = calculateAngularVelocity(yawAngleRad, previousYawAngleRad, lastTimeYaw);
-
-  // Calcula os sinais de controle (tensões)
-  float V_pitch, V_yaw;
-  calculateControlSignal(pitchAngleRad, yawAngleRad, pitchAngularVelocity, yawAngularVelocity, V_pitch, V_yaw);
+  // Calcula os sinais de controle (tensões) usando PID
+  float VPitch = pidControl(setpointPitch, pitchAngleRad, integralPitch, previousErrorPitch, KpPitch, KiPitch, KdPitch, dt, minVPitch, maxVPitch, -integralMaxPitch, integralMaxPitch);
+  float VYaw = pidControl(setpointYaw, yawAngleRad, integralYaw, previousErrorYaw, KpYaw, KiYaw, KdYaw, dt, minVYaw, maxVYaw, -integralMaxYaw, integralMaxYaw);
 
   // Controla os motores com as tensões calculadas
-  controlMotor(escPitch, V_pitch);
-  controlMotor(escYaw, V_yaw);
+  int pwmPitch = controlMotor(escPitch, VPitch, minVPitch, maxVPitch, PotMaxPitch);
+  int pwmYaw = controlMotor(escYaw, VYaw, minVYaw, maxVYaw, PotMaxYaw);
 
-  // Debug na serial, convertendo para graus
-  Serial.print("Pitch Angle (deg): ");
+  // Calcula a porcentagem de potência para cada motor
+  float powerPercentPitch = (pwmPitch / PotMaxPitch) * 100.0;
+  float powerPercentYaw = (pwmYaw / PotMaxYaw) * 100.0;
+
+  // Exibe os ângulos, tensões e porcentagem de potência no monitor serial
   Serial.print(degrees(pitchAngleRad));  // Convertendo de radianos para graus
-  Serial.print(" | Yaw Angle (deg): ");
-  Serial.println(degrees(yawAngleRad));  // Convertendo de radianos para graus
-
-  delay(100);  // Atraso para suavizar a leitura
+  Serial.print(" ");
+  Serial.print(degrees(yawAngleRad));  // Convertendo de radianos para graus
+  Serial.print(" ");
+  Serial.print(VPitch);
+  Serial.print(" ");
+  Serial.print(VYaw);
+  Serial.print(" ");
+  Serial.print(powerPercentPitch);
+  Serial.print(" ");
+  Serial.print(powerPercentYaw);
+  Serial.print(" ");
+  Serial.println(dt, 5);
 }
 
-// Função para calcular o sinal de controle (tensões) usando realimentação de estados
-void calculateControlSignal(float pitchAngle, float yawAngle, float pitchAngularVelocity, float yawAngularVelocity, float &V_pitch, float &V_yaw) {
-  // Vetor de estados X = [ângulo pitch, ângulo yaw, velocidade pitch, velocidade yaw]
-  float X[4] = { pitchAngle, yawAngle, pitchAngularVelocity, yawAngularVelocity };
+void processSetpoint(String input, float &setpoint, float minAngle, float maxAngle) {
+  input.trim();
+  // Caso o comando seja apenas para pitch (pX)
+  if (input.startsWith("p")) {
+    String pitchValue = input.substring(1);
+    setpoint = constrain(radians(pitchValue.toFloat()), minAngle, maxAngle);
+    Serial.println("Setpoint de Pitch atualizado.");
+  }
+}
 
-  // Cálculo das tensões de controle usando u = -K * X
-  V_pitch = -(K[0][0] * X[0] + K[0][1] * X[1] + K[0][2] * X[2] + K[0][3] * X[3]);
-  V_yaw = -(K[1][0] * X[0] + K[1][1] * X[1] + K[1][2] * X[2] + K[1][3] * X[3]);
+float pidControl(float setpoint, float currentAngle, float &integral, float &previousError, float Kp, float Ki, float Kd, float dt, float minVoltage, float maxVoltage, float integralMin, float integralMax) {
+  float error = setpoint - currentAngle;
+
+  integral += error * dt;  // Integral baseada no tempo de ciclo
+  integral = constrain(integral, integralMin, integralMax);
+
+  float derivative = (error - previousError) / dt;  // Derivada baseada no tempo de ciclo
+  previousError = error;
+
+  // Calcula o sinal de controle
+  float output = Kp * error + Ki * integral + Kd * derivative;
+
+  return constrain(output, minVoltage, maxVoltage);
 }
 
 // Função para controlar o motor (ESC) com base na tensão de controle
-void controlMotor(Servo &esc, float voltage) {
-  // Mapeia o valor de tensão para o intervalo de 0 a 180 (velocidade do motor)
-  int pwmValue = constrain(map(voltage, -10, 10, 0, 180), 0, 180);  // Ajuste de -10 a 10 conforme necessário
-  esc.write(pwmValue);  // Define o valor de controle do motor
-}
+int controlMotor(Servo &esc, float voltage, float minVoltage, float maxVoltage, float maxPwm) {
+  int pwmValue = map(voltage, minVoltage, maxVoltage, 0, maxPwm);
+  pwmValue = constrain(pwmValue, 0, maxPwm);  // Garante que o valor do PWM esteja entre 0 e Pitch
+  esc.write(pwmValue);                        // Define o valor de controle do motor
 
-// Função para calcular a velocidade angular (variação do ângulo por variação de tempo)
-float calculateAngularVelocity(float currentAngle, float &previousAngle, unsigned long &lastTime) {
-  unsigned long currentTime = millis();
-  float deltaTime = (currentTime - lastTime) / 1000.0;  // Tempo em segundos
-  lastTime = currentTime;
-
-  float angularVelocity = (currentAngle - previousAngle) / deltaTime;  // Velocidade angular em rad/s
-  previousAngle = currentAngle;
-
-  return angularVelocity;
+  return pwmValue;  // Retorna o valor do PWM para cálculo da porcentagem de potência
 }
 
 // Função para calcular o ângulo com base nos pulsos do encoder (em radianos)
 float calculateAngle(long pulseCount1, long pulseCount2) {
   long totalPulseCount = pulseCount1 - pulseCount2;
-  return (2 * PI * totalPulseCount) / PPR;  // Retorna o ângulo em radianos
-}
 
-// Função para processar a entrada serial para definir os setpoints (entrada em graus, cálculo em radianos)
-void processSetpoint(String input) {
-  input.trim();
-
-  // Caso o comando seja apenas para pitch (pX)
-  if (input.startsWith("p") && input.indexOf('y') == -1) {
-    String pitchValue = input.substring(1);
-    setpointPitch = constrain(radians(pitchValue.toFloat()), -pitchLimitRad, pitchLimitRad);  // Limita pitch em radianos
-    Serial.println("Setpoint de Pitch atualizado.");
-  }
-  // Caso o comando seja apenas para yaw (yX)
-  else if (input.startsWith("y") && input.indexOf('p') == -1) {
-    String yawValue = input.substring(1);
-    setpointYaw = constrain(radians(yawValue.toFloat()), -yawLimitRad, yawLimitRad);  // Limita yaw em radianos
-    Serial.println("Setpoint de Yaw atualizado.");
-  }
-  // Caso o comando seja para pitch e yaw (pXyY)
-  else if (input.startsWith("p") && input.indexOf('y') != -1) {
-    int splitIndex = input.indexOf('y');
-    String pitchValue = input.substring(1, splitIndex);
-    String yawValue = input.substring(splitIndex + 1);
-
-    setpointPitch = constrain(radians(pitchValue.toFloat()), -pitchLimitRad, pitchLimitRad);
-    setpointYaw = constrain(radians(yawValue.toFloat()), -yawLimitRad, yawLimitRad);
-    Serial.println("Setpoints de Pitch e Yaw atualizados.");
-  }
+  return (2 * PI * totalPulseCount) / PPR;
 }
 
 // Função para lidar com o encoder de pitch
